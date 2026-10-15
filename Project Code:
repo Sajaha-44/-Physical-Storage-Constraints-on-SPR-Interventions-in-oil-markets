@@ -1,0 +1,327 @@
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from scipy import stats
+import plotly.graph_objects as go
+
+try:
+    from IPython.display import display
+except ImportError:
+    display = print
+
+pd.set_option('display.float_format', lambda v: f'{v:,.4f}')
+pd.set_option('display.width', 200)
+pd.set_option('display.max_columns', 30)
+
+CSV_PATH = 'Oil Project Data Final.csv'
+
+LOWER_GRID = np.arange(20, 45.5, 1.0)
+UPPER_GRID = np.arange(60, 95.5, 1.0)
+MIN_OBS = 25
+N_BOOT = 199
+SEED = 42
+
+REGIMES = ['Low (slack)', 'Mid (normal)', 'High (congested)']
+COLORS = ['#2a9d8f', '#e9c46a', '#e76f51']
+
+df = pd.read_csv(CSV_PATH, thousands=',')
+df.columns = df.columns.str.strip()
+df = df.iloc[:, :13]
+
+df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%Y', errors='coerce')
+df = df.dropna(subset=['Date']).sort_values('Date').set_index('Date')
+
+Y_COL = 'implied physical carry spread (Yt)'
+X1_COL = 'Utilisation % Cushing'
+X2_COL = 'SPR crude level (In kbbl)'
+X3_COL = 'SPR flow rate'
+feature_cols = [Y_COL, X1_COL, X2_COL, X3_COL]
+
+for col in feature_cols:
+    cleaned = (df[col].astype(str)
+                      .str.replace('%', '', regex=False)
+                      .str.replace(',', '', regex=False)
+                      .str.strip())
+    df[col] = pd.to_numeric(cleaned, errors='coerce')
+
+df = df.dropna(subset=feature_cols)
+
+if df[X1_COL].max() <= 1.5:
+    df[X1_COL] = df[X1_COL] * 100
+    print('Utilisation was stored as a fraction, so I converted it to percent.')
+
+Y = df[Y_COL].values.astype(float)
+X1 = df[X1_COL].values.astype(float)
+X2 = df[X2_COL].values.astype(float)
+X3 = df[X3_COL].values.astype(float)
+
+print(f'{len(df)} observations, {df.index.min().date()} to {df.index.max().date()}')
+print(f'Cushing utilisation runs from {X1.min():.1f}% to {X1.max():.1f}%')
+print(f'SPR flow: mean {X3.mean():.4f}, std {X3.std():.4f}, '
+      f'{(X3 == 0).mean():.0%} of rows are exactly zero')
+
+
+def with_const(X):
+    return np.column_stack([np.ones(len(X)), X])
+
+
+def fit(y, X):
+    beta, _, rank, _ = np.linalg.lstsq(X, y, rcond=None)
+    resid = y - X @ beta
+    return float(resid @ resid), int(rank), beta
+
+
+def split_regimes(x1, b1, b2):
+    return [x1 < b1, (x1 >= b1) & (x1 < b2), x1 >= b2]
+
+
+def search_breaks(y, X, x1, lows, highs):
+    grid = np.full((len(lows), len(highs)), np.nan)
+    best = (np.inf, None, None, None)
+    for i, b1 in enumerate(lows):
+        if (x1 < b1).sum() < MIN_OBS:
+            continue
+        for j, b2 in enumerate(highs):
+            if b2 <= b1:
+                continue
+            masks = split_regimes(x1, b1, b2)
+            if min(m.sum() for m in masks) < MIN_OBS:
+                continue
+            total, rank = 0.0, 0
+            for m in masks:
+                rss, k, _ = fit(y[m], X[m])
+                total += rss
+                rank += k
+            grid[i, j] = total
+            if total < best[0]:
+                best = (total, b1, b2, rank)
+    return best, grid
+
+
+def chow(rss_pooled, k_pooled, rss_split, k_split, n):
+    df1 = k_split - k_pooled
+    df2 = n - k_split
+    F = ((rss_pooled - rss_split) / df1) / (rss_split / df2)
+    return F, stats.f.sf(F, df1, df2), df1, df2
+
+
+def bootstrap_chow(y, X, x1, lows, highs):
+    rng = np.random.default_rng(SEED)
+    _, _, beta = fit(y, X)
+    fitted = X @ beta
+    resid = y - fitted
+    out = []
+    for _ in range(N_BOOT):
+        fake = fitted + resid * rng.choice([-1.0, 1.0], size=len(y))
+        rss0, k0, _ = fit(fake, X)
+        (rss1, _, _, k1), _ = search_breaks(fake, X, x1, lows, highs)
+        out.append(chow(rss0, k0, rss1, k1, len(y))[0])
+    return np.array(out)
+
+
+def regime_tests(y, X, x1, b1, b2, names):
+    coef_rows, summary_rows = [], []
+    for label, m in zip(REGIMES, split_regimes(x1, b1, b2)):
+        Xm = X[m]
+        keep = [j for j in range(X.shape[1]) if np.std(Xm[:, j]) > 1e-12]
+        dropped = [names[j] for j in range(X.shape[1]) if j not in keep]
+        Xc = sm.add_constant(Xm[:, keep], has_constant='add')
+        classic = sm.OLS(y[m], Xc).fit()
+        lags = int(np.floor(4 * (m.sum() / 100) ** (2 / 9)))
+        robust = sm.OLS(y[m], Xc).fit(cov_type='HAC', cov_kwds={'maxlags': lags})
+        terms = ['const'] + [names[j] for j in keep]
+        for term, b, t, p, th, ph in zip(terms, classic.params, classic.tvalues,
+                                         classic.pvalues, robust.tvalues, robust.pvalues):
+            coef_rows.append({'Regime': label, 'Term': term, 'Coef': b,
+                              't (classic)': t, 'p (classic)': p,
+                              't (HAC)': th, 'p (HAC)': ph})
+        summary_rows.append({'Regime': label, 'n': int(m.sum()), 'R2': classic.rsquared,
+                             'Joint F p (classic)': classic.f_pvalue,
+                             'Joint F p (HAC)': robust.f_pvalue,
+                             'No variation (dropped)': ', '.join(dropped) or '-'})
+    return pd.DataFrame(coef_rows), pd.DataFrame(summary_rows)
+
+
+def run_model(label, X, names):
+    x1 = X[:, 0]
+    n = len(Y)
+    Xd = with_const(X)
+
+    rss_pooled, k_pooled, beta_pooled = fit(Y, Xd)
+    tss = float(((Y - Y.mean()) ** 2).sum())
+
+    lows = LOWER_GRID[(LOWER_GRID > x1.min()) & (LOWER_GRID < x1.max())]
+    highs = UPPER_GRID[(UPPER_GRID > x1.min()) & (UPPER_GRID < x1.max())]
+    (rss_split, b1, b2, k_split), grid = search_breaks(Y, Xd, x1, lows, highs)
+    if b1 is None:
+        raise ValueError('No valid breakpoint pair. Lower MIN_OBS or widen the grids.')
+
+    masks = split_regimes(x1, b1, b2)
+    betas = [fit(Y[m], Xd[m])[2] for m in masks]
+
+    F, p_textbook, df1, df2 = chow(rss_pooled, k_pooled, rss_split, k_split, n)
+    print(f'[{label[:2]}] bootstrapping the Chow test ({N_BOOT} reps)...')
+    F_boot = bootstrap_chow(Y, Xd, x1, lows, highs)
+    p_boot = (1 + (F_boot >= F).sum()) / (N_BOOT + 1)
+
+    coefs, summary = regime_tests(Y, X, x1, b1, b2, names)
+
+    return dict(label=label, X=X, names=names, n=n, beta_pooled=beta_pooled,
+                rss_pooled=rss_pooled, r2_pooled=1 - rss_pooled / tss,
+                rss_split=rss_split, r2_split=1 - rss_split / tss,
+                b1=b1, b2=b2, masks=masks, betas=betas, F=F, p_textbook=p_textbook,
+                df1=df1, df2=df2, p_boot=p_boot, coefs=coefs, summary=summary,
+                grid=grid, lows=lows, highs=highs)
+
+
+def show_results(r):
+    line = '=' * 78
+    print(f"\n{line}\n  {r['label']}\n{line}")
+
+    print('\n1) Single plane (pooled OLS)')
+    terms = ' + '.join(f'{b:,.6g}*{nm}' for b, nm in zip(r['beta_pooled'][1:], r['names']))
+    print(f"   Y = {r['beta_pooled'][0]:,.4f} + {terms}")
+    print(f"   RSS = {r['rss_pooled']:,.4f}   R2 = {r['r2_pooled']:.4f}   n = {r['n']}")
+
+    print('\n2) Breakpoints chosen (lowest total RSS on the grid)')
+    print(f"   Lower break: {r['b1']:.1f}% utilisation")
+    print(f"   Upper break: {r['b2']:.1f}% utilisation")
+
+    print('\n3) Three-regime model')
+    print(f"   RSS = {r['rss_split']:,.4f}   R2 = {r['r2_split']:.4f}   "
+          f"(RSS down {1 - r['rss_split'] / r['rss_pooled']:.1%})")
+
+    print('\n4) t-tests within each regime')
+    display(r['summary'])
+    display(r['coefs'])
+    print('   The classic p-values assume independent errors. For time series, '
+          'lean on the HAC p-values.')
+
+    print('\n5) Chow F-test, pooled plane vs three regimes')
+    print(f"   F({r['df1']}, {r['df2']}) = {r['F']:.4f}   textbook p = {r['p_textbook']:.4g}")
+    print(f"   Bootstrap p (allows for the breakpoint search) = {r['p_boot']:.4f}")
+    verdict = 'significantly better' if r['p_boot'] < 0.05 else 'not significantly better'
+    print(f'   The three-regime model is {verdict} at the 5% level.')
+
+
+def plane_height(beta, gx, gy, held):
+    z = beta[0] + beta[1] * gx + beta[2] * gy
+    for coef, value in zip(beta[3:], held):
+        z = z + coef * value
+    return z
+
+
+def plane_trace(gx, gy, gz, color, name, opacity):
+    return go.Surface(
+        x=gx, y=gy, z=gz, opacity=opacity, name=name, showscale=False,
+        colorscale=[[0, color], [1, color]], showlegend=True,
+        hovertemplate='Util %{x:.1f}%<br>SPR %{y:,.0f}<br>Spread %{z:.3f}<extra>'
+                      + name + '</extra>')
+
+
+def make_figure(r, title):
+    X, x1, x2 = r['X'], r['X'][:, 0], r['X'][:, 1]
+    has_flow = X.shape[1] > 2
+    held = X[:, 2:].mean(axis=0)
+    b1, b2 = r['b1'], r['b2']
+    traces = []
+    groups = {'pts': [], 'single': [], 'regimes': [], 'walls': []}
+
+    if has_flow:
+        traces.append(go.Scatter3d(
+            x=x1, y=x2, z=Y, mode='markers', name='Observations',
+            marker=dict(size=3.5, color=X[:, 2], colorscale='Viridis', showscale=True,
+                        colorbar=dict(title='SPR flow<br>(4th dim)', len=0.6)),
+            hovertemplate='Util %{x:.1f}%<br>SPR %{y:,.0f}<br>Spread %{z:.3f}<extra></extra>'))
+        groups['pts'].append(len(traces) - 1)
+    else:
+        for label, color, m in zip(REGIMES, COLORS, r['masks']):
+            traces.append(go.Scatter3d(x=x1[m], y=x2[m], z=Y[m], mode='markers',
+                                       name=f'{label} data', marker=dict(size=3.5, color=color)))
+            groups['pts'].append(len(traces) - 1)
+
+    gx, gy = np.meshgrid(np.linspace(x1.min(), x1.max(), 25),
+                         np.linspace(x2.min(), x2.max(), 25))
+    traces.append(plane_trace(gx, gy, plane_height(r['beta_pooled'], gx, gy, held),
+                              '#4361ee', 'Single pooled plane', 0.5))
+    groups['single'].append(len(traces) - 1)
+
+    for label, color, m, beta in zip(REGIMES, COLORS, r['masks'], r['betas']):
+        gx, gy = np.meshgrid(np.linspace(x1[m].min(), x1[m].max(), 15),
+                             np.linspace(x2[m].min(), x2[m].max(), 15))
+        traces.append(plane_trace(gx, gy, plane_height(beta, gx, gy, held),
+                                  color, f'{label} plane', 0.6))
+        groups['regimes'].append(len(traces) - 1)
+
+    for b, name in ((b1, 'Lower break'), (b2, 'Upper break')):
+        traces.append(go.Surface(
+            x=[[b, b], [b, b]], y=[[x2.min(), x2.max()]] * 2,
+            z=[[Y.min(), Y.min()], [Y.max(), Y.max()]], opacity=0.15, showscale=False,
+            colorscale=[[0, 'grey'], [1, 'grey']], name=f'{name} ({b:.0f}%)',
+            showlegend=True, hoverinfo='name'))
+        groups['walls'].append(len(traces) - 1)
+
+    def visible(*keys):
+        on = {i for k in keys for i in groups[k]}
+        return [i in on for i in range(len(traces))]
+
+    fig = go.Figure(traces)
+    for trace, v in zip(fig.data, visible('pts', 'regimes', 'walls')):
+        trace.visible = v
+
+    fig.update_layout(
+        title=(f"{title}<br><sup>Breaks at {b1:.0f}% and {b2:.0f}% | pooled RSS "
+               f"{r['rss_pooled']:,.2f} to three-regime RSS {r['rss_split']:,.2f} | "
+               f"Chow bootstrap p = {r['p_boot']:.3f}</sup>"),
+        scene=dict(xaxis_title='Cushing utilisation (%)',
+                   yaxis_title='SPR crude level (kbbl)',
+                   zaxis_title='Implied physical carry spread (USD/bbl)'),
+        height=720, margin=dict(l=0, r=0, t=90, b=0),
+        updatemenus=[dict(type='buttons', direction='right', x=0.02, y=1.02, buttons=[
+            dict(label='Before: single plane', method='update',
+                 args=[{'visible': visible('pts', 'single')}]),
+            dict(label='After: three regimes', method='update',
+                 args=[{'visible': visible('pts', 'regimes', 'walls')}]),
+            dict(label='Both', method='update',
+                 args=[{'visible': visible('pts', 'single', 'regimes', 'walls')}])])])
+    return fig
+
+
+def make_heatmap(r):
+    fig = go.Figure(go.Heatmap(z=r['grid'], x=r['highs'], y=r['lows'],
+                               colorscale='Viridis_r', colorbar=dict(title='Total RSS')))
+    fig.add_trace(go.Scatter(x=[r['b2']], y=[r['b1']], mode='markers', name='Optimum',
+                             marker=dict(color='red', size=12, symbol='x')))
+    fig.update_layout(title=f"Breakpoint grid, total RSS: {r['label'][:2]}",
+                      xaxis_title='Upper break (% utilisation)',
+                      yaxis_title='Lower break (% utilisation)', height=450)
+    return fig
+
+
+model_4d = run_model('4D MODEL: Y ~ Cushing util + SPR level + SPR flow',
+                     np.column_stack([X1, X2, X3]),
+                     ['Cushing util %', 'SPR level', 'SPR flow'])
+show_results(model_4d)
+
+model_3d = run_model('3D MODEL: Y ~ Cushing util + SPR level (flow collapsed)',
+                     np.column_stack([X1, X2]),
+                     ['Cushing util %', 'SPR level'])
+show_results(model_3d)
+
+summary = pd.DataFrame({
+    m['label'][:2]: {
+        'Pooled RSS': m['rss_pooled'], 'Three-regime RSS': m['rss_split'],
+        'Pooled R2': m['r2_pooled'], 'Three-regime R2': m['r2_split'],
+        'Lower break (%)': m['b1'], 'Upper break (%)': m['b2'],
+        'Chow F': m['F'], 'Chow p (textbook)': m['p_textbook'],
+        'Chow p (bootstrap)': m['p_boot']}
+    for m in (model_4d, model_3d)})
+print('\nSide by side')
+display(summary)
+
+print('\nDrag to rotate, scroll to zoom, and use the buttons to flip between '
+      'the single plane and the three regimes.')
+make_figure(model_4d, '4D model, sliced at mean SPR flow (flow shown as point colour)').show()
+make_figure(model_3d, '3D model: Y ~ Cushing utilisation + SPR level').show()
+make_heatmap(model_4d).show()
+make_heatmap(model_3d).show()
