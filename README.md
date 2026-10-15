@@ -1,0 +1,2 @@
+# -Physical-Storage-Constraints-on-SPR-Interventions-in-oil-markets
+A python script that uses ols regression both against the whole data set and across 3-capacity regimes at breakpoints decided by a boundary-grid search based breakpoint optimisation to determine if cost of carry implied by the calendar spread model shows that cost of carry and thus operational stresses increases rise sharply at these points
